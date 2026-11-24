@@ -25,6 +25,9 @@
 #include <msgpack.h>
 #include <float.h>
 #include <math.h>
+#include <limits.h>
+#include <fluent-bit/flb_mp.h>
+#include <fluent-bit/flb_log_event_decoder.h>
 #include "flb_tests_internal.h"
 
 static int msgpack_strncmp(char* str, size_t str_len, msgpack_object obj)
@@ -899,7 +902,120 @@ static void output_limit_record_rollback(void)
     }
 }
 
+static void check_output_counts(struct flb_log_event_encoder *encoder,
+                                 int expected_records, int expected_markers)
+{
+    int records;
+    int markers;
+
+    TEST_CHECK(flb_log_event_encoder_get_output_counts(encoder, &records, &markers) == 0);
+    TEST_CHECK(records == expected_records);
+    TEST_CHECK(markers == expected_markers);
+    TEST_CHECK(flb_mp_count_log_records(encoder->output_buffer, encoder->output_length) == records);
+}
+
+static void encoder_output_counts(void)
+{
+    struct flb_log_event_encoder encoder;
+    struct flb_log_event_encoder copy;
+    struct flb_log_event_decoder decoder;
+    struct flb_log_event event;
+    struct flb_time timestamp;
+    int32_t type;
+    int records;
+    int markers;
+    char *buffer;
+    size_t length;
+
+    TEST_ASSERT(flb_log_event_encoder_init(&encoder, FLB_LOG_EVENT_FORMAT_DEFAULT) == 0);
+    check_output_counts(&encoder, 0, 0);
+    TEST_ASSERT(flb_log_event_encoder_group_init(&encoder) == 0);
+    TEST_ASSERT(flb_log_event_encoder_group_header_end(&encoder) == 0);
+    TEST_ASSERT(flb_log_event_encoder_begin_record(&encoder) == 0);
+    TEST_ASSERT(flb_log_event_encoder_commit_record(&encoder) == 0);
+    TEST_ASSERT(flb_log_event_encoder_group_end(&encoder) == 0);
+    check_output_counts(&encoder, 1, 2);
+
+    TEST_ASSERT(flb_log_event_encoder_init(&copy, FLB_LOG_EVENT_FORMAT_DEFAULT) == 0);
+    TEST_ASSERT(flb_log_event_decoder_init(&decoder, encoder.output_buffer,
+                                          encoder.output_length) == 0);
+    flb_log_event_decoder_read_groups(&decoder, FLB_TRUE);
+    while (flb_log_event_decoder_next(&decoder, &event) == 0) {
+        TEST_ASSERT(flb_log_event_decoder_get_record_type(&event, &type) == 0);
+        TEST_ASSERT(flb_log_event_encoder_emit_raw_record_with_type(&copy,
+                        decoder.record_base, decoder.record_length, type) == 0);
+    }
+    check_output_counts(&copy, 1, 2);
+    flb_log_event_decoder_destroy(&decoder);
+
+    /* Failed writes and abandoned records cannot advance either count. */
+    copy.output_limit = copy.output_length;
+    TEST_ASSERT(flb_log_event_encoder_begin_record(&copy) == 0);
+    TEST_CHECK(flb_log_event_encoder_commit_record(&copy) < 0);
+    check_output_counts(&copy, 1, 2);
+    TEST_CHECK(flb_log_event_encoder_emit_raw_record_with_type(&copy,
+                    encoder.output_buffer, 1, FLB_LOG_EVENT_NORMAL) < 0);
+    check_output_counts(&copy, 1, 2);
+    TEST_ASSERT(flb_log_event_encoder_begin_record(&copy) == 0);
+    TEST_ASSERT(flb_log_event_encoder_rollback_record(&copy) == 0);
+    check_output_counts(&copy, 1, 2);
+    copy.output_limit = SIZE_MAX;
+
+    /* Arbitrary raw buffers and custom roots require the scan fallback. */
+    flb_log_event_encoder_reset(&copy);
+    TEST_ASSERT(flb_log_event_encoder_emit_raw_record(&copy, encoder.output_buffer,
+                                                      encoder.output_length) == 0);
+    TEST_CHECK(flb_log_event_encoder_get_output_counts(&copy, &records, &markers) == -1);
+    TEST_CHECK(records == -1 && markers == -1);
+    TEST_ASSERT(flb_log_event_encoder_begin_record(&copy) == 0);
+    TEST_ASSERT(flb_log_event_encoder_commit_record(&copy) == 0);
+    TEST_CHECK(flb_log_event_encoder_get_output_counts(&copy, &records, &markers) == -1);
+
+    flb_log_event_encoder_reset(&copy);
+    TEST_ASSERT(flb_log_event_encoder_set_root_from_raw_msgpack(&copy,
+                    encoder.output_buffer, encoder.output_length) == 0);
+    TEST_ASSERT(flb_log_event_encoder_emit_record(&copy) == 0);
+    TEST_CHECK(flb_log_event_encoder_get_output_counts(&copy, &records, &markers) == -1);
+
+    /* Buffer ownership transfer must not carry counts into the next batch. */
+    flb_log_event_encoder_reset(&copy);
+    TEST_ASSERT(flb_log_event_encoder_begin_record(&copy) == 0);
+    TEST_ASSERT(flb_log_event_encoder_commit_record(&copy) == 0);
+    buffer = copy.output_buffer;
+    length = copy.output_length;
+    flb_log_event_encoder_claim_internal_buffer_ownership(&copy);
+    TEST_CHECK(flb_log_event_encoder_get_output_counts(&copy, &records, &markers) == -1);
+    TEST_ASSERT(flb_log_event_encoder_begin_record(&copy) == 0);
+    TEST_ASSERT(flb_log_event_encoder_commit_record(&copy) == 0);
+    check_output_counts(&copy, 1, 0);
+    TEST_CHECK(copy.output_length == length);
+    flb_free(buffer);
+
+    /* Reserved unsigned EventTime seconds decode as group markers too. */
+    flb_log_event_encoder_reset(&copy);
+    TEST_ASSERT(flb_log_event_encoder_begin_record(&copy) == 0);
+    flb_time_set(&timestamp, UINT32_MAX, 0);
+    TEST_ASSERT(flb_log_event_encoder_set_timestamp(&copy, &timestamp) == 0);
+    TEST_ASSERT(flb_log_event_encoder_commit_record(&copy) == 0);
+    check_output_counts(&copy, 0, 1);
+
+    /* Overflow and writes outside the record API must never look exact. */
+    copy.output_records = INT_MAX;
+    TEST_ASSERT(flb_log_event_encoder_begin_record(&copy) == 0);
+    TEST_ASSERT(flb_log_event_encoder_commit_record(&copy) == 0);
+    TEST_CHECK(flb_log_event_encoder_get_output_counts(&copy, &records, &markers) == -1);
+    flb_log_event_encoder_reset(&copy);
+    TEST_ASSERT(msgpack_sbuffer_write(&copy.buffer, "x", 1) == 0);
+    TEST_CHECK(flb_log_event_encoder_get_output_counts(&copy, &records, &markers) == -1);
+    TEST_ASSERT(flb_log_event_encoder_begin_record(&copy) == 0);
+    TEST_ASSERT(flb_log_event_encoder_commit_record(&copy) == 0);
+    TEST_CHECK(flb_log_event_encoder_get_output_counts(&copy, &records, &markers) == -1);
+    flb_log_event_encoder_destroy(&copy);
+    flb_log_event_encoder_destroy(&encoder);
+}
+
 TEST_LIST = {
+    { "encoder_output_counts", encoder_output_counts },
     { "output_limit_record_rollback", output_limit_record_rollback},
     { "output_limit", output_limit},
     { "basic_format_fluent_bit_v2", basic_format_fluent_bit_v2},
