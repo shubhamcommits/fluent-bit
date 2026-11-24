@@ -200,7 +200,7 @@ def test_worker_threads_preserve_independent_batches(tmp_path, location, threade
 
 
 @pytest.mark.parametrize("location", ["input", "output"])
-@pytest.mark.parametrize("result", ["notouch", "modify", "drop"])
+@pytest.mark.parametrize("result", ["notouch", "modify", "mixed", "legacy", "drop", "empty"])
 def test_filter_chain_record_counts(tmp_path, location, result):
     processors = [{"name": "grep", "exclude": "absent .*"} for _ in range(4)]
     expected = deepcopy(RECORDS)
@@ -210,6 +210,20 @@ def test_filter_chain_record_counts(tmp_path, location, result):
         for record in expected:
             record["added"] = "yes"
         counts.append((2, 2))
+    elif result == "mixed":
+        processors.append({"name": "modify", "add": "target added"})
+        expected[1]["target"] = "added"
+        counts.append((2, 2))
+    elif result == "legacy":
+        # This plugin still uses cb_filter and must fall back to scanning.
+        processors.append({"name": "record_modifier", "record": "added yes"})
+        for record in expected:
+            record["added"] = "yes"
+        counts.append((2, 2))
+    elif result == "empty":
+        processors.append({"name": "grep", "regex": "target ^absent$"})
+        expected = []
+        counts.append((2, 0))
     elif result == "drop":
         processors.append({"name": "grep", "regex": "target ^original$"})
         expected = expected[:1]
