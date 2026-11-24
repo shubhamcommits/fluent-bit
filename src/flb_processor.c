@@ -2132,6 +2132,7 @@ static int processor_run(struct flb_processor *proc, struct chunk_codec *codec,
                                  int input_records, int *output_records)
 {
     int ret;
+    int out_records = -1;
     int pu_error;
     int unit_in_items;
     int unit_out_items;
@@ -2165,7 +2166,6 @@ static int processor_run(struct flb_processor *proc, struct chunk_codec *codec,
     const char *metrics_signal;
 #ifdef FLB_HAVE_METRICS
     int in_records = 0;
-    int out_records = 0;
     int diff = 0;
     uint64_t ts;
     char *name;
@@ -2372,6 +2372,8 @@ static int processor_run(struct flb_processor *proc, struct chunk_codec *codec,
         if (pu->unit_type == FLB_PROCESSOR_UNIT_FILTER) {
             /* get the filter context */
             f_ins = pu->ctx;
+            out_records = -1;
+            group_markers = -1;
 
             if (type == FLB_PROCESSOR_LOGS && pu->condition != NULL) {
                 ret = run_filter_with_condition(f_ins,
@@ -2386,13 +2388,9 @@ static int processor_run(struct flb_processor *proc, struct chunk_codec *codec,
             }
             else {
                 /* run the filtering callback */
-                ret = f_ins->p->cb_filter(cur_buf, cur_size,    /* msgpack buffer */
-                                          tag, tag_len,         /* tag */
-                                          &tmp_buf, &tmp_size,  /* output buffer */
-                                          f_ins,                /* filter instance */
-                                          proc->data,           /* (input/output) instance context */
-                                          f_ins->context,       /* filter context */
-                                          proc->config);
+                ret = flb_filter_run(f_ins, cur_buf, cur_size, tag, tag_len,
+                                      &tmp_buf, &tmp_size, proc->data, proc->config,
+                                      &out_records, &group_markers);
             }
 #ifdef FLB_HAVE_METRICS
             name = (char *) (flb_filter_name(f_ins));
@@ -2431,6 +2429,9 @@ static int processor_run(struct flb_processor *proc, struct chunk_codec *codec,
                     flb_free(tmp_buf);
                     *out_buf = NULL;
                     *out_size = 0;
+                    if (output_records != NULL) {
+                        *output_records = 0;
+                    }
                     unit_out_items = 0;
 
 #ifdef FLB_HAVE_METRICS
@@ -2464,10 +2465,13 @@ static int processor_run(struct flb_processor *proc, struct chunk_codec *codec,
 
                 /*
                  * A buffer with no group markers has no groups to normalize,
-                 * the scan that counts the records reports them.
+                 * whether its counts came from the encoder or the fallback scan.
                  */
-                if (flb_mp_scan_log_events(tmp_buf, tmp_size, &out_records,
-                                           &group_markers) == 0) {
+                if (out_records >= 0 && group_markers >= 0) {
+                    log_buffer_normalized = group_markers == 0;
+                }
+                else if (flb_mp_scan_log_events(tmp_buf, tmp_size, &out_records,
+                                                &group_markers) == 0) {
                     log_buffer_normalized = group_markers == 0;
                 }
                 else {
