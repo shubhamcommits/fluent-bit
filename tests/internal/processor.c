@@ -391,7 +391,7 @@ static void processor_filter_chain_counts(void)
     struct flb_filter_plugin legacy_plugins[4];
 
     flb_init_env();
-    for (mode = 0; mode < 8; mode++) {
+    for (mode = 0; mode < 16; mode++) {
         config = flb_config_init();
         TEST_ASSERT(config != NULL);
         proc = flb_processor_create(config, "filter_counts", NULL, 0);
@@ -399,9 +399,9 @@ static void processor_filter_chain_counts(void)
 
         for (i = 0; i < 4; i++) {
             units[i] = flb_processor_unit_create(proc, FLB_PROCESSOR_LOGS,
-                                                i == 2 ? "modify" : "grep");
+                                                i == 2 && !(mode & 8) ? "modify" : "grep");
             TEST_ASSERT(units[i] != NULL);
-            if (i == 2) {
+            if (i == 2 && !(mode & 8)) {
                 TEST_ASSERT(flb_processor_unit_set_property_str(units[i], "add",
                                                                 "added value") == 0);
             }
@@ -437,6 +437,11 @@ static void processor_filter_chain_counts(void)
                                                 mode & 2 ? 1 : -1,
                                                 &output_records) == 0);
         TEST_CHECK(output_records == 1);
+        if ((mode & 8) && !(mode & 1)) {
+            /* No-op batches without groups must not be allocated or copied. */
+            TEST_CHECK(output == data);
+            TEST_CHECK(output_size == bytes);
+        }
         TEST_CHECK(flb_mp_count_log_records(output, output_size) == 1);
         for (i = 0; i < 4; i++) {
             filter = units[i]->ctx;
@@ -453,6 +458,110 @@ static void processor_filter_chain_counts(void)
         flb_processor_destroy(proc);
         flb_config_exit(config);
     }
+}
+
+static void processor_notouch_malformed_suffix(void)
+{
+    char *data;
+    size_t bytes;
+    void *output;
+    size_t output_size;
+    int records;
+    struct flb_config *config;
+    struct flb_processor *proc;
+    struct flb_processor_unit *unit;
+
+    flb_init_env();
+    config = flb_config_init();
+    TEST_ASSERT(config != NULL);
+    proc = flb_processor_create(config, "malformed_batch", NULL, 0);
+    TEST_ASSERT(proc != NULL);
+    unit = flb_processor_unit_create(proc, FLB_PROCESSOR_LOGS, "grep");
+    TEST_ASSERT(unit != NULL);
+    TEST_ASSERT(flb_processor_unit_set_property_str(unit, "exclude", "absent .*") == 0);
+    TEST_ASSERT(flb_processor_init(proc) == 0);
+    TEST_ASSERT(create_msgpack_records(&data, &bytes) == 0);
+    data = flb_realloc(data, bytes + 1);
+    TEST_ASSERT(data != NULL);
+    data[bytes] = (char) 0xc1;
+    output = NULL;
+    output_size = 0;
+    records = -1;
+    TEST_CHECK(flb_processor_run_with_count(proc, 0, FLB_PROCESSOR_LOGS,
+                    "test", 4, data, bytes + 1, &output, &output_size, 1, &records) == 0);
+    /* Unknown/invalid group state must retain the normalizer's prefix behavior. */
+    TEST_CHECK(output != data);
+    TEST_CHECK(output_size == bytes);
+    TEST_CHECK(records == 1);
+    if (output != NULL) {
+        TEST_CHECK(memcmp(output, data, bytes) == 0);
+    }
+    flb_free(output);
+    flb_free(data);
+    flb_processor_destroy(proc);
+    flb_config_exit(config);
+}
+
+static int raw_append_group_end(struct flb_processor_instance **instances, size_t count,
+                                 const void *data, size_t bytes, void **output, size_t *size,
+                                 const char *tag, int tag_len)
+{
+    struct flb_log_event_encoder encoder;
+
+    TEST_ASSERT(flb_log_event_encoder_init(&encoder, FLB_LOG_EVENT_FORMAT_DEFAULT) == 0);
+    TEST_ASSERT(flb_log_event_encoder_emit_raw_record(&encoder, data, bytes) == 0);
+    TEST_ASSERT(flb_log_event_encoder_group_end(&encoder) == 0);
+    *output = encoder.output_buffer;
+    *size = encoder.output_length;
+    flb_log_event_encoder_claim_internal_buffer_ownership(&encoder);
+    flb_log_event_encoder_destroy(&encoder);
+    return FLB_PROCESSOR_RAW_MODIFIED;
+}
+
+static void processor_batch_group_state_invalidated(void)
+{
+    struct flb_processor_plugin plugin = {
+        .name = "raw_group_end",
+        .description = "append a stray group marker without changing cardinality",
+        .cb_process_logs_raw = raw_append_group_end
+    };
+    struct flb_config *config;
+    struct flb_processor *proc;
+    struct flb_processor_unit *unit;
+    struct flb_processor_instance *instance;
+    char *data;
+    size_t bytes;
+    void *output;
+    size_t output_size;
+    int records;
+
+    flb_init_env();
+    config = flb_config_init();
+    TEST_ASSERT(config != NULL);
+    mk_list_add(&plugin._head, &config->processor_plugins);
+    proc = flb_processor_create(config, "batch_groups", NULL, 0);
+    TEST_ASSERT(proc != NULL);
+    unit = flb_processor_unit_create(proc, FLB_PROCESSOR_LOGS, plugin.name);
+    TEST_ASSERT(unit != NULL);
+    TEST_ASSERT(flb_processor_init(proc) == 0);
+    instance = unit->ctx;
+    instance->logs_raw_enabled = FLB_TRUE;
+    TEST_ASSERT(create_msgpack_records(&data, &bytes) == 0);
+    output = NULL;
+    output_size = 0;
+    records = -1;
+    TEST_CHECK(flb_processor_run_with_count(proc, 0, FLB_PROCESSOR_LOGS,
+                    "test", 4, data, bytes, &output, &output_size, -1, &records) == 0);
+    TEST_CHECK(records == 1);
+    TEST_CHECK(output_size == bytes);
+    if (output != NULL) {
+        TEST_CHECK(memcmp(output, data, bytes) == 0);
+    }
+    flb_free(output);
+    flb_free(data);
+    flb_processor_destroy(proc);
+    mk_list_del(&plugin._head);
+    flb_config_exit(config);
 }
 
 static void filter_encoder_reported_counts(void)
@@ -2210,6 +2319,8 @@ static void processor_filter_empty_allocated_result(void)
 }
 
 TEST_LIST = {
+    { "processor_batch_group_state_invalidated", processor_batch_group_state_invalidated },
+    { "processor_notouch_malformed_suffix", processor_notouch_malformed_suffix },
     { "filter_encoder_reported_counts", filter_encoder_reported_counts },
     { "processor_filter_chain_counts", processor_filter_chain_counts },
     { "processor_filter_empty_allocated_result", processor_filter_empty_allocated_result },
