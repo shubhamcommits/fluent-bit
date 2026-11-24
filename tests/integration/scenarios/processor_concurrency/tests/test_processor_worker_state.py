@@ -197,3 +197,22 @@ def test_worker_threads_preserve_independent_batches(tmp_path, location, threade
     run_pipeline(tmp_path, processors, expected, location=location, storage="filesystem",
                  records=records, copies=32, clients=8, unique_copies=True,
                  input_workers=4, output_workers=4, input_threaded=threaded)
+
+
+@pytest.mark.parametrize("location", ["input", "output"])
+@pytest.mark.parametrize("result", ["notouch", "modify", "drop"])
+def test_filter_chain_record_counts(tmp_path, location, result):
+    processors = [{"name": "grep", "exclude": "absent .*"} for _ in range(4)]
+    expected = deepcopy(RECORDS)
+    counts = [(2, 2)] * 4
+    if result == "modify":
+        processors.append({"name": "modify", "add": "added yes"})
+        for record in expected:
+            record["added"] = "yes"
+        counts.append((2, 2))
+    elif result == "drop":
+        processors.append({"name": "grep", "regex": "target ^original$"})
+        expected = expected[:1]
+        counts.append((2, 1))
+    run_pipeline(tmp_path, processors, expected, location=location,
+                 storage="filesystem", stage_counts=counts, input_threaded=True)
