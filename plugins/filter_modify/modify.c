@@ -1499,12 +1499,13 @@ static int cb_modify_init(struct flb_filter_instance *f_ins,
     return 0;
 }
 
-static int cb_modify_filter(const void *data, size_t bytes,
+static int cb_modify_filter_with_count(const void *data, size_t bytes,
                             const char *tag, int tag_len,
                             void **out_buf, size_t * out_size,
                             struct flb_filter_instance *f_ins,
                             struct flb_input_instance *i_ins,
-                            void *context, struct flb_config *config)
+                            void *context, struct flb_config *config,
+                          int *out_records, int *out_group_markers)
 {
     struct flb_log_event_encoder log_encoder;
     struct flb_log_event_decoder log_decoder;
@@ -1553,10 +1554,10 @@ static int cb_modify_filter(const void *data, size_t bytes,
         }
         else if (modifications == 0) {
             /* not matched, so copy original event. */
-            ret = flb_log_event_encoder_emit_raw_record(
+            ret = flb_log_event_encoder_emit_raw_record_with_type(
                              &log_encoder,
                              log_decoder.record_base,
-                             log_decoder.record_length);
+                             log_decoder.record_length, FLB_LOG_EVENT_NORMAL);
         }
 
         total_modifications += modifications;
@@ -1574,6 +1575,7 @@ static int cb_modify_filter(const void *data, size_t bytes,
 
             ret = FLB_FILTER_MODIFIED;
 
+            flb_log_event_encoder_get_output_counts(&log_encoder, out_records, out_group_markers);
             flb_log_event_encoder_claim_internal_buffer_ownership(&log_encoder);
         }
         else {
@@ -1591,6 +1593,15 @@ static int cb_modify_filter(const void *data, size_t bytes,
     flb_log_event_encoder_destroy(&log_encoder);
 
     return ret;
+}
+
+static int cb_modify_filter(const void *data, size_t bytes,
+                          const char *tag, int tag_len, void **out_buf, size_t *out_size,
+                          struct flb_filter_instance *f_ins, struct flb_input_instance *i_ins,
+                          void *context, struct flb_config *config)
+{
+    return cb_modify_filter_with_count(data, bytes, tag, tag_len, out_buf, out_size,
+                                     f_ins, i_ins, context, config, NULL, NULL);
 }
 
 static int cb_modify_exit(void *data, struct flb_config *config)
@@ -1679,7 +1690,8 @@ struct flb_filter_plugin filter_modify_plugin = {
     .description = "modify records by applying rules",
     .cb_init = cb_modify_init,
     .cb_filter = cb_modify_filter,
+    .cb_filter_with_count = cb_modify_filter_with_count,
     .cb_exit = cb_modify_exit,
     .config_map = config_map,
-    .flags = 0
+    .flags = FLB_FILTER_OUTPUT_COUNTS
 };
