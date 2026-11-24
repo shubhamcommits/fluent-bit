@@ -21,6 +21,7 @@
 #include <fluent-bit/flb_log_event_encoder_primitives.h>
 #include <fluent-bit/flb_byteswap.h>
 #include <stdarg.h>
+#include <limits.h>
 #include <string.h>
 
 /*
@@ -48,6 +49,47 @@ void static inline flb_log_event_encoder_update_internal_state(
     context->output_length = context->buffer.size;
 }
 
+static void encoder_count_record(struct flb_log_event_encoder *context,
+                                 size_t original_size, int32_t record_type)
+{
+    if (context->counted_length != original_size || context->output_records < 0 ||
+        context->output_group_markers < 0) {
+        context->output_records = -1;
+        context->output_group_markers = -1;
+    }
+    else if (record_type == FLB_LOG_EVENT_NORMAL && context->output_records < INT_MAX) {
+        context->output_records++;
+    }
+    else if ((record_type == FLB_LOG_EVENT_GROUP_START ||
+              record_type == FLB_LOG_EVENT_GROUP_END) &&
+             context->output_group_markers < INT_MAX) {
+        context->output_group_markers++;
+    }
+    else {
+        context->output_records = -1;
+        context->output_group_markers = -1;
+    }
+    context->counted_length = context->buffer.size;
+}
+
+int flb_log_event_encoder_get_output_counts(struct flb_log_event_encoder *context,
+                                            int *records, int *group_markers)
+{
+    int valid;
+
+    valid = context->counted_length == context->buffer.size &&
+            context->output_buffer == context->buffer.data &&
+            context->output_length == context->buffer.size &&
+            context->output_records >= 0 && context->output_group_markers >= 0;
+    if (records != NULL) {
+        *records = valid ? context->output_records : -1;
+    }
+    if (group_markers != NULL) {
+        *group_markers = valid ? context->output_group_markers : -1;
+    }
+    return valid ? 0 : -1;
+}
+
 void flb_log_event_encoder_reset(struct flb_log_event_encoder *context)
 {
     flb_log_event_encoder_dynamic_field_reset(&context->metadata);
@@ -55,6 +97,9 @@ void flb_log_event_encoder_reset(struct flb_log_event_encoder *context)
     flb_log_event_encoder_dynamic_field_reset(&context->root);
 
     msgpack_sbuffer_clear(&context->buffer);
+    context->output_records = 0;
+    context->output_group_markers = 0;
+    context->counted_length = 0;
 
     flb_log_event_encoder_update_internal_state(context);
 }
@@ -156,28 +201,50 @@ void flb_log_event_encoder_claim_internal_buffer_ownership(
 {
     if (context != NULL) {
         msgpack_sbuffer_release(&context->buffer);
+        context->output_records = 0;
+        context->output_group_markers = 0;
+        context->counted_length = 0;
     }
 }
 
-int flb_log_event_encoder_emit_raw_record(struct flb_log_event_encoder *context,
-                                          const char *buffer,
-                                          size_t length)
+static int encoder_emit_raw_record(struct flb_log_event_encoder *context,
+                                    const char *buffer, size_t length, int32_t record_type)
 {
     int result;
+    size_t original_size;
 
+    original_size = context->buffer.size;
     result = msgpack_pack_str_body(&context->packer, buffer, length);
-
     if (result != 0) {
+        context->buffer.size = original_size;
         result = FLB_EVENT_ENCODER_ERROR_SERIALIZATION_FAILURE;
     }
     else {
+        encoder_count_record(context, original_size, record_type);
         result = FLB_EVENT_ENCODER_SUCCESS;
     }
 
     flb_log_event_encoder_update_internal_state(context);
     flb_log_event_encoder_reset_record(context);
-
     return result;
+}
+
+int flb_log_event_encoder_emit_raw_record(struct flb_log_event_encoder *context,
+                                          const char *buffer, size_t length)
+{
+    /* Raw bytes may contain multiple events or an unvalidated root. */
+    return encoder_emit_raw_record(context, buffer, length, INT32_MIN);
+}
+
+int flb_log_event_encoder_emit_raw_record_with_type(struct flb_log_event_encoder *context,
+                                                   const char *buffer, size_t length,
+                                                   int32_t record_type)
+{
+    if (length == 0 || (record_type != FLB_LOG_EVENT_NORMAL &&
+        record_type != FLB_LOG_EVENT_GROUP_START && record_type != FLB_LOG_EVENT_GROUP_END)) {
+        return FLB_EVENT_ENCODER_ERROR_INVALID_ARGUMENT;
+    }
+    return encoder_emit_raw_record(context, buffer, length, record_type);
 }
 
 /*
@@ -188,6 +255,7 @@ int flb_log_event_encoder_emit_raw_record(struct flb_log_event_encoder *context,
 int flb_log_event_encoder_emit_record(struct flb_log_event_encoder *context)
 {
     int      result;
+    int32_t  record_type;
     char     ts_buf[8];
     char     rec_header[5];
     size_t   original_size;
@@ -199,6 +267,23 @@ int flb_log_event_encoder_emit_record(struct flb_log_event_encoder *context)
     }
 
     original_size = context->buffer.size;
+    record_type = INT32_MIN;
+    if (context->root.size == 0) {
+        if (context->format != FLB_LOG_EVENT_FORMAT_FORWARD_LEGACY &&
+            context->timestamp.tm.tv_nsec == 0 &&
+            (context->timestamp.tm.tv_sec == FLB_LOG_EVENT_GROUP_START ||
+             context->timestamp.tm.tv_sec == FLB_LOG_EVENT_GROUP_END ||
+             (uint64_t) context->timestamp.tm.tv_sec == UINT32_MAX ||
+             (uint64_t) context->timestamp.tm.tv_sec == UINT32_MAX - 1)) {
+            record_type = (uint32_t) context->timestamp.tm.tv_sec == UINT32_MAX ?
+                          FLB_LOG_EVENT_GROUP_START : FLB_LOG_EVENT_GROUP_END;
+        }
+        else if (flb_time_is_valid_eventtime(&context->timestamp) &&
+                 (context->format == FLB_LOG_EVENT_FORMAT_FORWARD_LEGACY ||
+                  (uint64_t) context->timestamp.tm.tv_sec < UINT32_MAX - 1)) {
+            record_type = FLB_LOG_EVENT_NORMAL;
+        }
+    }
     result = FLB_EVENT_ENCODER_SUCCESS;
 
     if (context->root.size == 0) {
@@ -310,6 +395,9 @@ int flb_log_event_encoder_emit_record(struct flb_log_event_encoder *context)
 
     if (result != FLB_EVENT_ENCODER_SUCCESS) {
         context->buffer.size = original_size;
+    }
+    else {
+        encoder_count_record(context, original_size, record_type);
     }
 
     flb_log_event_encoder_update_internal_state(context);

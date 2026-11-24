@@ -247,7 +247,28 @@ struct flb_log_event_encoder {
     msgpack_sbuffer                             buffer;
 
     int                                         format;
+    /* Logical records exclude group markers; -1 means a scan is required. */
+    int                                         output_records;
+    int                                         output_group_markers;
+    size_t                                      counted_length;
 };
+
+/*
+ * Read before transferring buffer ownership. Returns -1 and unknown counts for
+ * untyped raw writes, custom roots, overflow, or unaccounted buffer writes.
+ * Raw MessagePack fields supplied to structured records must be valid values.
+ * Either output pointer may be NULL.
+ */
+int flb_log_event_encoder_get_output_counts(struct flb_log_event_encoder *context,
+                                            int *records, int *group_markers);
+
+/*
+ * Copy exactly one complete decoded event whose type has already been validated.
+ * Use emit_raw_record() for arbitrary bytes or buffers containing multiple events.
+ */
+int flb_log_event_encoder_emit_raw_record_with_type(struct flb_log_event_encoder *context,
+                                                   const char *buffer, size_t length,
+                                                   int32_t record_type);
 
 int flb_log_event_encoder_init(struct flb_log_event_encoder *context,
                                int format);
