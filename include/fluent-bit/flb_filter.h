@@ -41,6 +41,9 @@
 #define FLB_FILTER_MODIFIED 1
 #define FLB_FILTER_NOTOUCH  2
 
+/* Declares the appended cb_filter_with_count callback. */
+#define FLB_FILTER_OUTPUT_COUNTS 1
+
 /*
  * Types are defined by creating a mask using numbers. However, it's important
  * to note that the masks used in this process are different from the ones used
@@ -56,7 +59,7 @@ struct flb_filter_instance;
 
 struct flb_filter_plugin {
     int event_type;        /* Event type: logs, metrics, traces */
-    int flags;             /* Flags (not available at the moment */
+    int flags;             /* Optional callback capabilities */
     char *name;            /* Filter short name            */
     char *description;     /* Description                  */
 
@@ -78,6 +81,16 @@ struct flb_filter_plugin {
     int (*cb_notification) (struct flb_filter_instance *, struct flb_config *, void *);
 
     struct mk_list _head;  /* Link to parent list (config->filters) */
+
+    /*
+     * Optional cb_filter equivalent with per-call output counts. Set both
+     * counts to nonnegative values only for an exact result; -1 requests a
+     * scan. Records exclude group markers. Keep cb_filter for legacy callers.
+     */
+    int (*cb_filter_with_count) (const void *, size_t, const char *, int,
+                                void **, size_t *, struct flb_filter_instance *,
+                                struct flb_input_instance *, void *, struct flb_config *,
+                                int *, int *);
 };
 
 struct flb_filter_instance {
@@ -153,5 +166,10 @@ int flb_filter_init(struct flb_config *config, struct flb_filter_instance *ins);
 int flb_filter_init_all(struct flb_config *config);
 void flb_filter_set_context(struct flb_filter_instance *ins, void *context);
 void flb_filter_instance_destroy(struct flb_filter_instance *ins);
+
+int flb_filter_run(struct flb_filter_instance *ins,
+                   const void *data, size_t bytes, const char *tag, int tag_len,
+                   void **out_buf, size_t *out_size, struct flb_input_instance *input,
+                   struct flb_config *config, int *records, int *group_markers);
 
 #endif

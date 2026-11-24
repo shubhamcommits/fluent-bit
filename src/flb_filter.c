@@ -119,6 +119,29 @@ static inline int prop_key_check(const char *key, const char *kv, int k_len)
     return -1;
 }
 
+int flb_filter_run(struct flb_filter_instance *ins,
+                   const void *data, size_t bytes, const char *tag, int tag_len,
+                   void **out_buf, size_t *out_size, struct flb_input_instance *input,
+                   struct flb_config *config, int *records, int *group_markers)
+{
+    int ret;
+
+    *records = -1;
+    *group_markers = -1;
+    if ((ins->p->flags & FLB_FILTER_OUTPUT_COUNTS) && ins->p->cb_filter_with_count != NULL) {
+        ret = ins->p->cb_filter_with_count(data, bytes, tag, tag_len, out_buf, out_size,
+                                          ins, input, ins->context, config,
+                                          records, group_markers);
+        if (ret != FLB_FILTER_MODIFIED || *records < 0 || *group_markers < 0) {
+            *records = -1;
+            *group_markers = -1;
+        }
+        return ret;
+    }
+    return ins->p->cb_filter(data, bytes, tag, tag_len, out_buf, out_size,
+                             ins, input, ins->context, config);
+}
+
 void flb_filter_do(struct flb_input_chunk *ic,
                    const void *data, size_t bytes,
                    void **out_data, size_t *out_bytes,
@@ -126,9 +149,10 @@ void flb_filter_do(struct flb_input_chunk *ic,
                    struct flb_config *config)
 {
     int ret;
+    int out_records;
+    int group_markers;
 #ifdef FLB_HAVE_METRICS
     int in_records = 0;
-    int out_records = 0;
     int diff = 0;
     int pre_records = 0;
     uint64_t ts;
@@ -202,15 +226,9 @@ void flb_filter_do(struct flb_input_chunk *ic,
 #endif /* FLB_HAVE_CHUNK_TRACE */
 
             /* Invoke the filter callback */
-            ret = f_ins->p->cb_filter(work_data,      /* msgpack buffer   */
-                                      work_size,      /* msgpack size     */
-                                      ntag, tag_len,  /* input tag        */
-                                      &out_buf,       /* new data         */
-                                      &out_size,      /* new data size    */
-                                      f_ins,          /* filter instance  */
-                                      i_ins,          /* input instance   */
-                                      f_ins->context, /* filter priv data */
-                                      config);
+            ret = flb_filter_run(f_ins, work_data, work_size, ntag, tag_len,
+                                  &out_buf, &out_size, i_ins, config,
+                                  &out_records, &group_markers);
 
 #ifdef FLB_HAVE_CHUNK_TRACE
             if (ic->trace) {
@@ -272,7 +290,9 @@ void flb_filter_do(struct flb_input_chunk *ic,
                     break;
                 }
                 else {
-                    out_records = flb_mp_count_log_records(out_buf, out_size);
+                    if (out_records < 0) {
+                        out_records = flb_mp_count_log_records(out_buf, out_size);
+                    }
                     FLB_WASM_TRACE(flb_wasm_trace_filter(f_ins, i_ins, ntag, tag_len,
                                                          in_records, out_records,
                                                          FLB_TRUE));
