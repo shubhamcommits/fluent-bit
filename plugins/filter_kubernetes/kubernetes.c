@@ -656,13 +656,14 @@ static int pack_map_content(struct flb_log_event_encoder *log_encoder,
     return 0;
 }
 
-static int cb_kube_filter(const void *data, size_t bytes,
+static int cb_kube_filter_with_count(const void *data, size_t bytes,
                           const char *tag, int tag_len,
                           void **out_buf, size_t *out_bytes,
                           struct flb_filter_instance *f_ins,
                           struct flb_input_instance *i_ins,
                           void *filter_context,
-                          struct flb_config *config)
+                          struct flb_config *config,
+                          int *out_records, int *out_group_markers)
 {
     int ret;
     size_t pre = 0;
@@ -897,12 +898,22 @@ record_cleanup:
     *out_buf   = log_encoder.output_buffer;
     *out_bytes = log_encoder.output_length;
 
+    flb_log_event_encoder_get_output_counts(&log_encoder, out_records, out_group_markers);
     flb_log_event_encoder_claim_internal_buffer_ownership(&log_encoder);
 
     flb_log_event_decoder_destroy(&log_decoder);
     flb_log_event_encoder_destroy(&log_encoder);
 
     return FLB_FILTER_MODIFIED;
+}
+
+static int cb_kube_filter(const void *data, size_t bytes,
+                          const char *tag, int tag_len, void **out_buf, size_t *out_size,
+                          struct flb_filter_instance *f_ins, struct flb_input_instance *i_ins,
+                          void *context, struct flb_config *config)
+{
+    return cb_kube_filter_with_count(data, bytes, tag, tag_len, out_buf, out_size,
+                                     f_ins, i_ins, context, config, NULL, NULL);
 }
 
 static int cb_kube_exit(void *data, struct flb_config *config)
@@ -1366,7 +1377,8 @@ struct flb_filter_plugin filter_kubernetes_plugin = {
     .description  = "Filter to append Kubernetes metadata",
     .cb_init      = cb_kube_init,
     .cb_filter    = cb_kube_filter,
+    .cb_filter_with_count = cb_kube_filter_with_count,
     .cb_exit      = cb_kube_exit,
     .config_map   = config_map,
-    .flags        = 0
+    .flags        = FLB_FILTER_OUTPUT_COUNTS
 };
