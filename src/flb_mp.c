@@ -1112,10 +1112,19 @@ int flb_mp_normalize_log_buffer_groups_msgpack_ex(const void *in_buf, size_t in_
                                                   char **out_buf, size_t *out_size,
                                                   int flags)
 {
+    return flb_mp_normalize_log_buffer_groups_msgpack_with_count(in_buf, in_size,
+                                                                out_buf, out_size, flags, NULL);
+}
+
+int flb_mp_normalize_log_buffer_groups_msgpack_with_count(const void *in_buf, size_t in_size,
+                                                         char **out_buf, size_t *out_size,
+                                                         int flags, int *out_records)
+{
     int i;
     int ret;
     int entry_count;
     int stack_count;
+    int records = 0;
     int seen_start = FLB_FALSE;
     int leading_end = FLB_FALSE;
     int *group_stack;
@@ -1123,13 +1132,23 @@ int flb_mp_normalize_log_buffer_groups_msgpack_ex(const void *in_buf, size_t in_
     struct flb_log_event log_event;
     struct flb_log_event_decoder decoder;
     struct flb_mp_record_span *entries;
-    msgpack_sbuffer mp_sbuf;
+    size_t retained_size = 0;
+    size_t copied_size = 0;
+    size_t span_size = 0;
+    const char *span_start = NULL;
+    char *output = NULL;
 
+    if (out_records != NULL) {
+        *out_records = -1;
+    }
     *out_buf = NULL;
     *out_size = 0;
 
     entry_count = flb_mp_count(in_buf, in_size);
     if (entry_count <= 0) {
+        if (out_records != NULL) {
+            *out_records = 0;
+        }
         return 0;
     }
 
@@ -1192,6 +1211,9 @@ int flb_mp_normalize_log_buffer_groups_msgpack_ex(const void *in_buf, size_t in_
 
     entry_count = i;
     if (entry_count == 0) {
+        if (out_records != NULL) {
+            *out_records = 0;
+        }
         flb_free(group_has_content);
         flb_free(group_stack);
         flb_free(entries);
@@ -1249,29 +1271,56 @@ int flb_mp_normalize_log_buffer_groups_msgpack_ex(const void *in_buf, size_t in_
         entries[group_stack[stack_count]].keep = FLB_FALSE;
     }
 
-    msgpack_sbuffer_init(&mp_sbuf);
-
+    /* Size and count the retained batch before allocating its output once. */
     for (i = 0; i < entry_count; i++) {
         if (entries[i].keep != FLB_TRUE) {
             continue;
         }
-
-        msgpack_sbuffer_write(&mp_sbuf, entries[i].base, entries[i].length);
+        retained_size += entries[i].length;
+        if (entries[i].type == FLB_LOG_EVENT_NORMAL) {
+            records++;
+        }
     }
 
-    if (mp_sbuf.size > 0) {
-        *out_buf = mp_sbuf.data;
-        *out_size = mp_sbuf.size;
-    }
-    else {
-        msgpack_sbuffer_destroy(&mp_sbuf);
+    ret = 0;
+    if (retained_size > 0) {
+        output = flb_malloc(retained_size);
+        if (output == NULL) {
+            flb_errno();
+            ret = -1;
+        }
+        else {
+            /* Removed markers split spans; adjacent retained records copy together. */
+            for (i = 0; i < entry_count; i++) {
+                if (entries[i].keep != FLB_TRUE) {
+                    continue;
+                }
+                if (span_start != NULL && entries[i].base != span_start + span_size) {
+                    memcpy(output + copied_size, span_start, span_size);
+                    copied_size += span_size;
+                    span_size = 0;
+                }
+                if (span_size == 0) {
+                    span_start = entries[i].base;
+                }
+                span_size += entries[i].length;
+            }
+            if (span_size > 0) {
+                memcpy(output + copied_size, span_start, span_size);
+            }
+            *out_buf = output;
+            *out_size = retained_size;
+        }
     }
 
     flb_free(group_has_content);
     flb_free(group_stack);
     flb_free(entries);
 
-    return 0;
+    if (ret == 0 && out_records != NULL) {
+        *out_records = records;
+    }
+    return ret;
 }
 
 int flb_mp_normalize_log_buffer_groups(const void *in_buf, size_t in_size,
