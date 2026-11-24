@@ -2143,6 +2143,8 @@ static int processor_run(struct flb_processor *proc, struct chunk_codec *codec,
     int unit_lock_held;
     int log_buffer_normalized = FLB_FALSE;
     int group_markers = 0;
+    int log_buffer_group_markers = -1;
+    int normalized_records;
     int log_buffer_records = input_records;
     void *cur_buf = NULL;
     size_t cur_size;
@@ -2243,9 +2245,17 @@ static int processor_run(struct flb_processor *proc, struct chunk_codec *codec,
                 unit_in_items = log_buffer_records;
             }
             else {
-                unit_in_items = flb_mp_count_log_records(cur_buf, cur_size);
+                if (chunk_cobj == NULL &&
+                    flb_mp_scan_log_events(cur_buf, cur_size, &unit_in_items,
+                                           &log_buffer_group_markers) == 0) {
+                    log_buffer_normalized = log_buffer_group_markers == 0;
+                }
+                else {
+                    unit_in_items = flb_mp_count_log_records(cur_buf, cur_size);
+                    log_buffer_group_markers = -1;
+                }
                 if (chunk_cobj == NULL) {
-                    /* Reuse this count until a unit replaces the serialized buffer. */
+                    /* Batch metadata remains valid across unchanged units. */
                     log_buffer_records = unit_in_items;
                 }
             }
@@ -2271,6 +2281,9 @@ static int processor_run(struct flb_processor *proc, struct chunk_codec *codec,
                     }
                     cur_buf = tmp_buf;
                     cur_size = tmp_size;
+                    /* The raw callback promises cardinality, not group layout. */
+                    log_buffer_normalized = FLB_FALSE;
+                    log_buffer_group_markers = -1;
                 }
                 log_buffer_records = unit_in_items;
                 head = raw_last;
@@ -2313,6 +2326,7 @@ static int processor_run(struct flb_processor *proc, struct chunk_codec *codec,
                     cur_size = tmp_size;
                     log_buffer_records = window_records;
                     log_buffer_normalized = window_normalized;
+                    log_buffer_group_markers = -1;
 
                     /* continue after the last unit of the run */
                     head = run_end;
@@ -2476,8 +2490,10 @@ static int processor_run(struct flb_processor *proc, struct chunk_codec *codec,
                 }
                 else {
                     out_records = flb_mp_count_log_records(tmp_buf, tmp_size);
+                    group_markers = -1;
                     log_buffer_normalized = FLB_FALSE;
                 }
+                log_buffer_group_markers = log_buffer_normalized ? 0 : group_markers;
                 log_buffer_records = out_records;
                 unit_out_items = out_records;
 #ifdef FLB_HAVE_METRICS
@@ -2575,6 +2591,7 @@ static int processor_run(struct flb_processor *proc, struct chunk_codec *codec,
                                 chunk_has_group_markers(chunk_cobj) ?
                                 input_group_flags(&group_flags, data, data_size) : 0) == 0;
                         log_buffer_records = flb_mp_chunk_cobj_count_log_records(chunk_cobj);
+                        log_buffer_group_markers = -1;
 
                         if (cfl_list_size(&chunk_cobj->records) == 0) {
                             if (output_records) {
@@ -2793,14 +2810,25 @@ static int processor_run(struct flb_processor *proc, struct chunk_codec *codec,
         }
     }
 
+    /* Inspect unknown batch metadata once, at the serialization boundary. */
+    if (type == FLB_PROCESSOR_LOGS && cur_buf != NULL &&
+        !log_buffer_normalized && log_buffer_group_markers < 0) {
+        if (flb_mp_scan_log_events(cur_buf, cur_size, &out_records, &group_markers) == 0) {
+            log_buffer_records = out_records;
+            log_buffer_group_markers = group_markers;
+            log_buffer_normalized = group_markers == 0;
+        }
+    }
+
     /* set output buffer */
     if (type == FLB_PROCESSOR_LOGS &&
         cur_buf != NULL && !log_buffer_normalized) {
-        ret = flb_mp_normalize_log_buffer_groups_msgpack_ex(cur_buf, cur_size,
+        ret = flb_mp_normalize_log_buffer_groups_msgpack_with_count(cur_buf, cur_size,
                                                             (char **) &tmp_buf, &tmp_size,
                                                             input_group_flags(&group_flags,
                                                                               data,
-                                                                              data_size));
+                                                                              data_size),
+                                                            &normalized_records);
         if (ret == 0) {
             if (cur_buf != data) {
                 flb_free(cur_buf);
@@ -2808,7 +2836,7 @@ static int processor_run(struct flb_processor *proc, struct chunk_codec *codec,
 
             cur_buf = tmp_buf;
             cur_size = tmp_size;
-            log_buffer_records = -1;
+            log_buffer_records = normalized_records;
         }
     }
 
