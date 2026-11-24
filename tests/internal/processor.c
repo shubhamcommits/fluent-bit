@@ -388,9 +388,10 @@ static void processor_filter_chain_counts(void)
     struct flb_processor *proc;
     struct flb_processor_unit *units[4];
     struct flb_filter_instance *filter;
+    struct flb_filter_plugin legacy_plugins[4];
 
     flb_init_env();
-    for (mode = 0; mode < 4; mode++) {
+    for (mode = 0; mode < 8; mode++) {
         config = flb_config_init();
         TEST_ASSERT(config != NULL);
         proc = flb_processor_create(config, "filter_counts", NULL, 0);
@@ -410,6 +411,16 @@ static void processor_filter_chain_counts(void)
             }
         }
         TEST_ASSERT(flb_processor_init(proc) == 0);
+        if (mode & 4) {
+            /* Old plugin descriptors must keep using the scan fallback. */
+            for (i = 0; i < 4; i++) {
+                filter = units[i]->ctx;
+                legacy_plugins[i] = *filter->p;
+                legacy_plugins[i].flags &= ~FLB_FILTER_OUTPUT_COUNTS;
+                legacy_plugins[i].cb_filter_with_count = NULL;
+                filter->p = &legacy_plugins[i];
+            }
+        }
         if (mode & 1) {
             TEST_ASSERT(create_grouped_msgpack_records(&data, &bytes) == 0);
         }
@@ -442,6 +453,55 @@ static void processor_filter_chain_counts(void)
         flb_processor_destroy(proc);
         flb_config_exit(config);
     }
+}
+
+static void filter_encoder_reported_counts(void)
+{
+    int records;
+    int markers;
+    int ret;
+    char *data;
+    size_t bytes;
+    void *output;
+    size_t output_size;
+    struct flb_config *config;
+    struct flb_processor *proc;
+    struct flb_processor_unit *unit;
+    struct flb_filter_instance *filter;
+
+    flb_init_env();
+    config = flb_config_init();
+    TEST_ASSERT(config != NULL);
+    proc = flb_processor_create(config, "reported_counts", NULL, 0);
+    TEST_ASSERT(proc != NULL);
+    unit = flb_processor_unit_create(proc, FLB_PROCESSOR_LOGS, "modify");
+    TEST_ASSERT(unit != NULL);
+    TEST_ASSERT(flb_processor_unit_set_property_str(unit, "add", "added value") == 0);
+    TEST_ASSERT(flb_processor_init(proc) == 0);
+    TEST_ASSERT(create_grouped_msgpack_records(&data, &bytes) == 0);
+    filter = unit->ctx;
+    output = NULL;
+    output_size = 0;
+    ret = flb_filter_run(filter, data, bytes, "test", 4, &output, &output_size,
+                         NULL, config, &records, &markers);
+    TEST_CHECK(ret == FLB_FILTER_MODIFIED);
+    TEST_CHECK(records == 1);
+    TEST_CHECK(markers == 0);
+    TEST_CHECK(flb_mp_count_log_records(output, output_size) == records);
+    flb_free(data);
+
+    /* A subsequent NOTOUCH callback cannot reuse the preceding output count. */
+    data = output;
+    bytes = output_size;
+    output = NULL;
+    output_size = 0;
+    ret = flb_filter_run(filter, data, bytes, "test", 4, &output, &output_size,
+                         NULL, config, &records, &markers);
+    TEST_CHECK(ret == FLB_FILTER_NOTOUCH);
+    TEST_CHECK(records == -1 && markers == -1);
+    flb_free(data);
+    flb_processor_destroy(proc);
+    flb_config_exit(config);
 }
 
 static void processor_private_inputs_use_main_loop()
@@ -2107,6 +2167,7 @@ static int filter_empty_allocated_result(const void *data, size_t bytes,
 static void processor_filter_empty_allocated_result(void)
 {
     int ret;
+    int output_records = -1;
     char *input;
     size_t input_size;
     void *output = NULL;
@@ -2133,12 +2194,14 @@ static void processor_filter_empty_allocated_result(void)
     plugin = *original_plugin;
     plugin.cb_filter = filter_empty_allocated_result;
     filter->p = &plugin;
-    ret = flb_processor_run(processor, 0, FLB_PROCESSOR_LOGS,
-                            "test", 4, input, input_size, &output, &output_size);
+    ret = flb_processor_run_with_count(processor, 0, FLB_PROCESSOR_LOGS,
+                            "test", 4, input, input_size, &output, &output_size,
+                            -1, &output_records);
     filter->p = original_plugin;
     TEST_CHECK(ret == 0);
     TEST_CHECK(output == NULL);
     TEST_CHECK(output_size == 0);
+    TEST_CHECK(output_records == 0);
 
     /* Valgrind must also verify that the callback's allocation was released. */
     flb_free(input);
@@ -2147,6 +2210,7 @@ static void processor_filter_empty_allocated_result(void)
 }
 
 TEST_LIST = {
+    { "filter_encoder_reported_counts", filter_encoder_reported_counts },
     { "processor_filter_chain_counts", processor_filter_chain_counts },
     { "processor_filter_empty_allocated_result", processor_filter_empty_allocated_result },
     {"log_hold_bounds", test_log_hold_bounds},
