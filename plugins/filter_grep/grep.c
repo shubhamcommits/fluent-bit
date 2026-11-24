@@ -283,13 +283,14 @@ static inline int grep_filter_data_and_or(msgpack_object map, struct grep_ctx *c
     return found ? GREP_RET_EXCLUDE : GREP_RET_KEEP;
 }
 
-static int cb_grep_filter(const void *data, size_t bytes,
+static int cb_grep_filter_with_count(const void *data, size_t bytes,
                           const char *tag, int tag_len,
                           void **out_buf, size_t *out_size,
                           struct flb_filter_instance *f_ins,
                           struct flb_input_instance *i_ins,
                           void *context,
-                          struct flb_config *config)
+                          struct flb_config *config,
+                          int *out_records, int *out_group_markers)
 {
     int ret;
     int old_size = 0;
@@ -343,10 +344,10 @@ static int cb_grep_filter(const void *data, size_t bytes,
         }
 
         if (ret == GREP_RET_KEEP) {
-            ret = flb_log_event_encoder_emit_raw_record(
+            ret = flb_log_event_encoder_emit_raw_record_with_type(
                              &log_encoder,
                              log_decoder.record_base,
-                             log_decoder.record_length);
+                             log_decoder.record_length, FLB_LOG_EVENT_NORMAL);
 
             new_size++;
         }
@@ -376,6 +377,7 @@ static int cb_grep_filter(const void *data, size_t bytes,
 
         ret = FLB_FILTER_MODIFIED;
 
+        flb_log_event_encoder_get_output_counts(&log_encoder, out_records, out_group_markers);
         flb_log_event_encoder_claim_internal_buffer_ownership(&log_encoder);
     }
     else {
@@ -389,6 +391,15 @@ static int cb_grep_filter(const void *data, size_t bytes,
     flb_log_event_encoder_destroy(&log_encoder);
 
     return ret;
+}
+
+static int cb_grep_filter(const void *data, size_t bytes,
+                          const char *tag, int tag_len, void **out_buf, size_t *out_size,
+                          struct flb_filter_instance *f_ins, struct flb_input_instance *i_ins,
+                          void *context, struct flb_config *config)
+{
+    return cb_grep_filter_with_count(data, bytes, tag, tag_len, out_buf, out_size,
+                                     f_ins, i_ins, context, config, NULL, NULL);
 }
 
 static int cb_grep_exit(void *data, struct flb_config *config)
@@ -428,7 +439,8 @@ struct flb_filter_plugin filter_grep_plugin = {
     .description  = "grep events by specified field values",
     .cb_init      = cb_grep_init,
     .cb_filter    = cb_grep_filter,
+    .cb_filter_with_count = cb_grep_filter_with_count,
     .cb_exit      = cb_grep_exit,
     .config_map   = config_map,
-    .flags        = 0
+    .flags        = FLB_FILTER_OUTPUT_COUNTS
 };
